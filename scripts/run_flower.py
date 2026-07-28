@@ -25,6 +25,7 @@ from redo_by_sara.federated import (
     create_partition_summary,
     evaluate_model,
     get_parameters,
+    regression_r2_score,
     save_partition_summary,
     save_round_history,
     set_parameters,
@@ -240,11 +241,16 @@ def main() -> None:
                 learning_rate=self.experiment.training.learning_rate,
                 weight_decay=self.experiment.training.weight_decay,
             )
-            return get_parameters(model), len(self.partition.train_indices), {
+            metrics = {
                 "client_id": self.partition.client_id,
                 "train_loss": float(train_result.loss),
                 "train_score": float(train_result.score),
             }
+            if self.task == "regression":
+                metrics["train_r2"] = float(
+                    regression_r2_score(train_result.outputs, train_result.targets)
+                )
+            return get_parameters(model), len(self.partition.train_indices), metrics
 
         def evaluate(
             self,
@@ -278,16 +284,20 @@ def main() -> None:
             "val_loss": float(result.loss),
             "val_score": float(result.score),
         }
+        if config.training.task == "regression":
+            row["val_r2"] = float(
+                regression_r2_score(result.outputs, result.targets)
+            )
         eval_rows.append(row)
         if run is not None:
-            wandb.log(
-                {
-                    "federated/round": server_round,
-                    "federated/val_loss": result.loss,
-                    "federated/val_score": result.score,
-                },
-                step=server_round,
-            )
+            log_payload = {
+                "federated/round": server_round,
+                "federated/val_loss": result.loss,
+                "federated/val_score": result.score,
+            }
+            if "val_r2" in row:
+                log_payload["federated/val_r2"] = row["val_r2"]
+            wandb.log(log_payload, step=server_round)
         return float(result.loss), {"val_score": float(result.score)}
 
     class TrackingFedAvg(FedAvg):
@@ -314,17 +324,21 @@ def main() -> None:
                     client_row["train_loss"] = float(metrics["train_loss"])
                 if "train_score" in metrics:
                     client_row["train_score"] = float(metrics["train_score"])
+                if "train_r2" in metrics:
+                    client_row["train_r2"] = float(metrics["train_r2"])
                 self.client_rows.append(client_row)
 
                 if run is not None:
-                    wandb.log(
-                        {
-                            f"clients/{client_id}/train_loss": client_row.get("train_loss"),
-                            f"clients/{client_id}/train_score": client_row.get("train_score"),
-                            f"clients/{client_id}/num_examples": client_row["num_examples"],
-                        },
-                        step=server_round,
-                    )
+                    client_log_payload = {
+                        f"clients/{client_id}/train_loss": client_row.get("train_loss"),
+                        f"clients/{client_id}/train_score": client_row.get("train_score"),
+                        f"clients/{client_id}/num_examples": client_row["num_examples"],
+                    }
+                    if "train_r2" in client_row:
+                        client_log_payload[f"clients/{client_id}/train_r2"] = client_row[
+                            "train_r2"
+                        ]
+                    wandb.log(client_log_payload, step=server_round)
 
             row = {"round": float(server_round)}
             if "train_loss" in aggregated_metrics:
@@ -414,6 +428,11 @@ def main() -> None:
             task=config.training.task,
             device=server_device,
         )
+        test_r2 = (
+            float(regression_r2_score(test_result.outputs, test_result.targets))
+            if config.training.task == "regression"
+            else None
+        )
 
         round_rows = _merge_round_rows(strategy.fit_rows, eval_rows)
         save_round_history(history_path, round_rows)
@@ -441,22 +460,30 @@ def main() -> None:
             "best_val_round": int(best_val_row["round"]),
             "best_val_loss": float(best_val_row["val_loss"]),
             "best_val_score": float(best_val_row["val_score"]),
+            "best_val_r2": (
+                float(best_val_row["val_r2"])
+                if "val_r2" in best_val_row
+                else None
+            ),
             "test_loss": float(test_result.loss),
             "test_score": float(test_result.score),
+            "test_r2": test_r2,
         }
         summary_path.write_text(json.dumps(summary, indent=2))
 
         if run is not None:
-            wandb.log(
-                {
-                    "test_loss": summary["test_loss"],
-                    "test_score": summary["test_score"],
-                    "best_val_round": summary["best_val_round"],
-                    "best_val_loss": summary["best_val_loss"],
-                    "best_val_score": summary["best_val_score"],
-                },
-                step=config.federated.num_rounds,
-            )
+            final_log_payload = {
+                "test_loss": summary["test_loss"],
+                "test_score": summary["test_score"],
+                "best_val_round": summary["best_val_round"],
+                "best_val_loss": summary["best_val_loss"],
+                "best_val_score": summary["best_val_score"],
+            }
+            if summary["best_val_r2"] is not None:
+                final_log_payload["best_val_r2"] = summary["best_val_r2"]
+            if summary["test_r2"] is not None:
+                final_log_payload["test_r2"] = summary["test_r2"]
+            wandb.log(final_log_payload, step=config.federated.num_rounds)
             run.summary.update(summary)
 
         print(json.dumps(summary, indent=2))
