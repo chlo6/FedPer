@@ -336,6 +336,13 @@ def main() -> None:
             parameters: list[Any],
             config: dict[str, Any],
         ) -> tuple[list[Any], int, dict[str, float]]:
+            # Ray may create clients in a different order between runs. Seed
+            # each client's initial personal head independently so the same
+            # experiment seed produces the same starting head every time.
+            client_seed = self.experiment.seed + int(self.partition.client_id)
+            torch.manual_seed(client_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(client_seed)
             model = create_federated_model(
                 self.artifact,
                 self.task,
@@ -545,7 +552,11 @@ def main() -> None:
             return None
     
         personalized_val_loss = weighted_loss / total_examples
-        personalized_val_score = weighted_score / total_examples
+        personalized_val_score = (
+            math.sqrt(personalized_val_loss)
+            if config.training.task == "regression"
+            else weighted_score / total_examples
+        )
         personalized_val_r2 = (
             float(
                 regression_r2_score(
@@ -566,6 +577,9 @@ def main() -> None:
         ] = float(personalized_val_score)
 
         if personalized_val_r2 is not None:
+            wandb_metrics[
+                "personalized/combined_val_rmse"
+            ] = float(personalized_val_score)
             wandb_metrics[
                 "personalized/combined_val_r2"
             ] = personalized_val_r2
@@ -842,7 +856,11 @@ def main() -> None:
         if total_test_examples == 0:
             raise RuntimeError("No personalized FedPer client test examples were found.")
         personalized_test_loss = weighted_test_loss / total_test_examples
-        personalized_test_score = weighted_test_score / total_test_examples
+        personalized_test_score = (
+            math.sqrt(personalized_test_loss)
+            if config.training.task == "regression"
+            else weighted_test_score / total_test_examples
+        )
         personalized_test_r2 = (
             float(
                 regression_r2_score(
@@ -913,6 +931,9 @@ def main() -> None:
                 "personalized/weighted_test_score": personalized_test_score,
             }
             if personalized_test_r2 is not None:
+                personalized_metrics[
+                    "personalized/combined_test_rmse"
+                ] = personalized_test_score
                 personalized_metrics[
                     "personalized/combined_test_r2"
                 ] = personalized_test_r2
