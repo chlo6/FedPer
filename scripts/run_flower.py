@@ -315,7 +315,11 @@ def main() -> None:
                 num_workers=experiment.training.num_workers,
                 shuffle=True,
                 seed=experiment.seed + int(partition.client_id),
-                class_ids=self.class_ids,
+                class_ids=(
+                    self.class_ids
+                    if self.task == "classification"
+                    else None
+                ),
             )
 
         def get_parameters(self, config: dict[str, Any]) -> list[Any]:
