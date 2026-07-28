@@ -33,6 +33,7 @@ from redo_by_sara.federated import (
     evaluate_model,
     get_base_parameters,
     get_head_state,
+    regression_r2_score,
     save_partition_summary,
     save_round_history,
     set_base_parameters,
@@ -358,11 +359,16 @@ def main() -> None:
             # Flower may recreate client objects between rounds, so persist the
             # personal head explicitly. Only the base is returned to the server.
             torch.save(get_head_state(model), self.head_path)
-            return get_base_parameters(model), len(self.partition.train_indices), {
+            metrics = {
                 "client_id": self.partition.client_id,
                 "train_loss": float(train_result.loss),
                 "train_score": float(train_result.score),
             }
+            if self.task == "regression":
+                metrics["train_r2"] = float(
+                    regression_r2_score(train_result.outputs, train_result.targets)
+                )
+            return get_base_parameters(model), len(self.partition.train_indices), metrics
 
         def evaluate(
             self,
@@ -411,6 +417,8 @@ def main() -> None:
         total_examples = 0
         weighted_loss = 0.0
         weighted_score = 0.0
+        combined_outputs: list[torch.Tensor] = []
+        combined_targets: list[torch.Tensor] = []
     
         wandb_metrics: dict[str, float] = {
             "federated/round": float(server_round),
@@ -501,6 +509,19 @@ def main() -> None:
             total_examples += num_examples
             weighted_loss += client_result.loss * num_examples
             weighted_score += client_result.score * num_examples
+
+            if config.training.task == "regression":
+                client_val_r2 = float(
+                    regression_r2_score(
+                        client_result.outputs,
+                        client_result.targets,
+                    )
+                )
+                combined_outputs.append(client_result.outputs)
+                combined_targets.append(client_result.targets)
+                wandb_metrics[
+                    f"personalized/client_{client_id}/val_r2"
+                ] = client_val_r2
     
             # These keys automatically become W&B line graphs because
             # they are logged once after every federated round.
@@ -525,6 +546,16 @@ def main() -> None:
     
         personalized_val_loss = weighted_loss / total_examples
         personalized_val_score = weighted_score / total_examples
+        personalized_val_r2 = (
+            float(
+                regression_r2_score(
+                    torch.cat(combined_outputs, dim=0),
+                    torch.cat(combined_targets, dim=0),
+                )
+            )
+            if config.training.task == "regression"
+            else None
+        )
     
         wandb_metrics[
             "personalized/weighted_val_loss"
@@ -533,6 +564,11 @@ def main() -> None:
         wandb_metrics[
             "personalized/weighted_val_score"
         ] = float(personalized_val_score)
+
+        if personalized_val_r2 is not None:
+            wandb_metrics[
+                "personalized/combined_val_r2"
+            ] = personalized_val_r2
     
         if run is not None:
             wandb.log(
@@ -546,13 +582,18 @@ def main() -> None:
             "val_loss": float(personalized_val_loss),
             "val_score": float(personalized_val_score),
         }
+        if personalized_val_r2 is not None:
+            row["val_r2"] = personalized_val_r2
         eval_rows.append(row)
     
         # Flower also records these as centralized metrics, but they are
         # now real personalized validation results instead of proxy results.
-        return float(personalized_val_loss), {
+        evaluation_metrics = {
             "val_score": float(personalized_val_score),
         }
+        if personalized_val_r2 is not None:
+            evaluation_metrics["val_r2"] = personalized_val_r2
+        return float(personalized_val_loss), evaluation_metrics
 
     class TrackingFedAvg(FedAvg):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -578,17 +619,21 @@ def main() -> None:
                     client_row["train_loss"] = float(metrics["train_loss"])
                 if "train_score" in metrics:
                     client_row["train_score"] = float(metrics["train_score"])
+                if "train_r2" in metrics:
+                    client_row["train_r2"] = float(metrics["train_r2"])
                 self.client_rows.append(client_row)
 
                 if run is not None:
-                    wandb.log(
-                        {
-                            f"clients/{client_id}/train_loss": client_row.get("train_loss"),
-                            f"clients/{client_id}/train_score": client_row.get("train_score"),
-                            f"clients/{client_id}/num_examples": client_row["num_examples"],
-                        },
-                        step=server_round,
-                    )
+                    client_log_payload = {
+                        f"clients/{client_id}/train_loss": client_row.get("train_loss"),
+                        f"clients/{client_id}/train_score": client_row.get("train_score"),
+                        f"clients/{client_id}/num_examples": client_row["num_examples"],
+                    }
+                    if "train_r2" in client_row:
+                        client_log_payload[f"clients/{client_id}/train_r2"] = client_row[
+                            "train_r2"
+                        ]
+                    wandb.log(client_log_payload, step=server_round)
 
             row = {"round": float(server_round)}
             if "train_loss" in aggregated_metrics:
@@ -670,6 +715,8 @@ def main() -> None:
         total_test_examples = 0
         weighted_test_loss = 0.0
         weighted_test_score = 0.0
+        combined_test_outputs: list[torch.Tensor] = []
+        combined_test_targets: list[torch.Tensor] = []
         for partition in client_partitions:
             class_ids = client_class_ids(artifact, partition.subject_ids)
             head_path = client_head_dir / f"client_{partition.client_id}_head.pt"
@@ -730,6 +777,16 @@ def main() -> None:
                 "test_score": float(client_result.score),
             }
 
+            if config.training.task == "regression":
+                client_test_row["test_r2"] = float(
+                    regression_r2_score(
+                        client_result.outputs,
+                        client_result.targets,
+                    )
+                )
+                combined_test_outputs.append(client_result.outputs)
+                combined_test_targets.append(client_result.targets)
+
             if config.training.task == "classification":
                 local_label_map = client_local_label_map(
                     artifact,
@@ -786,6 +843,16 @@ def main() -> None:
             raise RuntimeError("No personalized FedPer client test examples were found.")
         personalized_test_loss = weighted_test_loss / total_test_examples
         personalized_test_score = weighted_test_score / total_test_examples
+        personalized_test_r2 = (
+            float(
+                regression_r2_score(
+                    torch.cat(combined_test_outputs, dim=0),
+                    torch.cat(combined_test_targets, dim=0),
+                )
+            )
+            if config.training.task == "regression"
+            else None
+        )
 
         round_rows = _merge_round_rows(strategy.fit_rows, eval_rows)
         save_round_history(history_path, round_rows)
@@ -829,8 +896,14 @@ def main() -> None:
             "best_val_round": int(best_val_row["round"]),
             "best_val_loss": float(best_val_row["val_loss"]),
             "best_val_score": float(best_val_row["val_score"]),
+            "best_val_r2": (
+                float(best_val_row["val_r2"])
+                if "val_r2" in best_val_row
+                else None
+            ),
             "test_loss": float(personalized_test_loss),
             "test_score": float(personalized_test_score),
+            "test_r2": personalized_test_r2,
         }
         summary_path.write_text(json.dumps(summary, indent=2))
 
@@ -839,6 +912,10 @@ def main() -> None:
                 "personalized/weighted_test_loss": personalized_test_loss,
                 "personalized/weighted_test_score": personalized_test_score,
             }
+            if personalized_test_r2 is not None:
+                personalized_metrics[
+                    "personalized/combined_test_r2"
+                ] = personalized_test_r2
             confusion_images: dict[str, Any] = {}
         
             for client_row in personalized_test_rows:
@@ -856,6 +933,11 @@ def main() -> None:
                     f"personalized/client_{client_id}/num_examples"
                 ] = client_row["num_examples"]
 
+                if "test_r2" in client_row:
+                    personalized_metrics[
+                        f"personalized/client_{client_id}/test_r2"
+                    ] = client_row["test_r2"]
+
                 confusion_plot_path = client_row.get("confusion_plot_path")
                 if isinstance(confusion_plot_path, str):
                     confusion_images[
@@ -871,6 +953,14 @@ def main() -> None:
                     "best_val_round": summary["best_val_round"],
                     "best_val_loss": summary["best_val_loss"],
                     "best_val_score": summary["best_val_score"],
+                    **(
+                        {
+                            "best_val_r2": summary["best_val_r2"],
+                            "test_r2": summary["test_r2"],
+                        }
+                        if config.training.task == "regression"
+                        else {}
+                    ),
                 },
                 step=config.federated.num_rounds,
             )
