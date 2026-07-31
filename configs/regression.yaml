@@ -1,14 +1,14 @@
 # seed: 4601
 seed: 1234
 output_dir: artifacts
-artifact_name: raw_windows.pt
+artifact_name: raw_windows_regression.pt
 
 data:
   dataset_root: /content/TestData/20251124_Testing
   additional_dataset_roots:
     - /content/TestData/Test_2
   excluded_subjects_by_dataset:
-    20251124_Testing: ["006"]
+    20251124_Testing: ["6"]
   sensor_channel_map:
     "1": [1]
     "2": [2]
@@ -30,9 +30,9 @@ data:
     "14": [18]
     "15": [19]
     "16": [20]
-  selected_sensors: ["1", "2", "3", "4", "5", "6", "7", "8x", "8y", "8z", "9x", "9y", "9z", "10", "11", "12", "13", "14", "15", "16"]
+  selected_sensors: ["8z", "7", "6", "5", "4", "3", "2", "1"]
   target_sample_rate: 400.0
-  window_seconds: 5.0
+  window_seconds: 3.0
   step_seconds: 1.0
   train_ratio: 0.6
   val_ratio: 0.2
