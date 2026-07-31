@@ -83,6 +83,19 @@ def _as_index_list(indices: Sequence[int] | torch.Tensor) -> list[int]:
     return [int(index) for index in indices]
 
 
+def metadata_belongs_to_subjects(
+    metadata_row: dict[str, object],
+    subject_ids: Sequence[str] | set[str],
+) -> bool:
+    """Keep background windows with the client that owns their source run."""
+    owned_subjects = {str(subject_id) for subject_id in subject_ids}
+    subject_id = str(metadata_row["subject_id"])
+    source_subject_id = metadata_row.get("background_source_subject_id")
+    if subject_id == "0" and source_subject_id is not None:
+        return str(source_subject_id) in owned_subjects
+    return subject_id in owned_subjects
+
+
 def client_class_ids(
     artifact: dict[str, object],
     subject_ids: Sequence[str],
