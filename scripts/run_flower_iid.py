@@ -16,6 +16,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from redo_by_sara.artifact_contract import load_validated_artifact
 from redo_by_sara.config import ExperimentConfig, load_config
 from redo_by_sara.federated import (
     ClientPartition,
@@ -183,7 +184,7 @@ def main() -> None:
             "Flower is not installed in this environment. Install `flwr[simulation]` first."
         ) from exc
 
-    artifact = torch.load(config.artifact_path, map_location="cpu", weights_only=False)
+    artifact = load_validated_artifact(config.artifact_path, config)
     client_partitions, client_subjects = build_iid_run_partitions(
         artifact=artifact,
         num_clients=config.federated.num_clients,
