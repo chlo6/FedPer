@@ -46,20 +46,23 @@ def add_background_class(
         raise ValueError(
             f"{unmatched_regression} regression windows were not found in classification."
         )
-    if not background_indices:
-        if "0" in classification["subject_to_class"]:
-            return classification, 0
-        raise ValueError("No classification-only windows were found for background class 0.")
-
-    old_mapping = {
+    existing_mapping = {
         str(subject): int(class_id)
         for subject, class_id in classification["subject_to_class"].items()
     }
-    if "0" in old_mapping:
-        raise ValueError(
-            "Artifact already maps subject 0 but still has unmatched windows; "
-            "refusing to guess their labels."
-        )
+    if "0" in existing_mapping:
+        background_class = existing_mapping["0"]
+        targets = classification["classification_targets"]
+        if any(int(targets[index]) != background_class for index in background_indices):
+            raise ValueError(
+                "Artifact maps subject 0, but its classification-only windows are not "
+                "consistently labeled as background."
+            )
+        return classification, 0
+    if not background_indices:
+        raise ValueError("No classification-only windows were found for background class 0.")
+
+    old_mapping = existing_mapping
 
     repaired = copy.deepcopy(classification)
     new_mapping = {"0": 0}
