@@ -1,6 +1,6 @@
 seed: 4601
 output_dir: artifacts
-artifact_name: raw_windows.pt
+artifact_name: raw_windows_classification.pt
 
 data:
   dataset_root: TestData/20251124_Testing
@@ -25,9 +25,9 @@ data:
     "14": [18]
     "15": [19]
     "16": [20]
-  selected_sensors: ["1", "2", "3", "4", "5", "6", "7", "8x", "8y", "8z", "9x", "9y", "9z", "10", "11", "12", "13", "14", "15", "16"]
+  selected_sensors: ["8z", "7", "6", "5", "4", "3", "2", "1"]
   target_sample_rate: 400.0
-  window_seconds: 5.0
+  window_seconds: 3.0
   step_seconds: 1.0
   train_ratio: 0.6
   val_ratio: 0.2
@@ -51,9 +51,9 @@ federated:
   client_num_cpus: 1.0
   client_num_gpus: 0.0
   client_subjects:
-    "0": ["003", "004"]
-    "1": ["005", "006"]
-    "2": ["007", "008"]
+    "0": ["0", "1", "2"]
+    "1": ["0", "3", "4"]
+    "2": ["0", "5", "7", "8"]
 
 wandb:
   enabled: true

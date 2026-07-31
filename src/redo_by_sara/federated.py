@@ -150,7 +150,11 @@ def build_client_partitions(
     partitions: dict[str, list[int]] = {client_id: [] for client_id in sorted(expected_client_ids)}
     for index in global_train_indices:
         subject_id = str(metadata[index]["subject_id"])
-        owners = subject_owners.get(subject_id)
+        source_subject_id = metadata[index].get("background_source_subject_id")
+        if subject_id == "0" and source_subject_id is not None:
+            owners = subject_owners.get(str(source_subject_id))
+        else:
+            owners = subject_owners.get(subject_id)
         if owners is None:
             raise ValueError(f"No client assignment found for subject {subject_id}.")
         # Add this index to all clients that own the subject
