@@ -34,6 +34,7 @@ from redo_by_sara.federated import (
     evaluate_model,
     get_base_parameters,
     get_head_state,
+    metadata_belongs_to_subjects,
     regression_r2_score,
     save_partition_summary,
     save_round_history,
@@ -453,7 +454,7 @@ def main() -> None:
             client_val_indices = [
                 index
                 for index in global_val_indices
-                if str(metadata[index]["subject_id"]) in client_subjects
+                if metadata_belongs_to_subjects(metadata[index], client_subjects)
             ]
     
             if not client_val_indices:
@@ -741,7 +742,7 @@ def main() -> None:
             client_test_indices = [
                 index
                 for index in test_indices
-                if str(metadata[index]["subject_id"]) in subject_ids
+                if metadata_belongs_to_subjects(metadata[index], subject_ids)
             ]
             if not client_test_indices:
                 continue
