@@ -43,7 +43,7 @@ training:
   num_workers: 0
 
 federated:
-  result_name: semi_non_iid_fedper
+  result_name: semi_non_iid_fedper_kd
   num_clients: 3
   num_rounds: 30
   local_epochs: 3
@@ -56,9 +56,15 @@ federated:
     "1": ["0", "3", "4", "8"]
     "2": ["0", "5", "7", "8"]
 
+knowledge_distillation:
+  enabled: true
+  weight: 0.5
+  temperature: 2.0
+  start_round: 2
+
 wandb:
   enabled: true
   project: fedper-noniid
   entity: null
-  tags: ["semi-non-iid", "classification"]
+  tags: ["semi-non-iid", "classification", "fedper-kd"]
   watch: true

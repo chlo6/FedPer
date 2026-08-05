@@ -56,6 +56,14 @@ class FederatedConfig:
 
 
 @dataclass
+class KnowledgeDistillationConfig:
+    enabled: bool = False
+    weight: float = 0.0
+    temperature: float = 1.0
+    start_round: int = 2
+
+
+@dataclass
 class ExperimentConfig:
     seed: int
     output_dir: Path
@@ -65,6 +73,7 @@ class ExperimentConfig:
     wandb: WandBConfig
     config_path: Path
     federated: FederatedConfig | None = None
+    knowledge_distillation: KnowledgeDistillationConfig | None = None
 
     @property
     def artifact_path(self) -> Path:
@@ -94,6 +103,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     train_cfg = payload["training"]
     wandb_cfg = payload.get("wandb", {})
     federated_cfg = payload.get("federated")
+    kd_cfg = payload.get("knowledge_distillation")
 
     output_dir = _resolve_path(project_root, payload.get("output_dir", "artifacts"))
     dataset_root = _resolve_path(project_root, data_cfg["dataset_root"])
@@ -145,7 +155,25 @@ def load_config(path: str | Path) -> ExperimentConfig:
             raise ValueError("federated.num_rounds must be at least 1.")
         if federated.local_epochs < 1:
             raise ValueError("federated.local_epochs must be at least 1.")
-    
+
+    knowledge_distillation: KnowledgeDistillationConfig | None = None
+    if kd_cfg is not None:
+        knowledge_distillation = KnowledgeDistillationConfig(
+            enabled=bool(kd_cfg.get("enabled", False)),
+            weight=float(kd_cfg.get("weight", 0.0)),
+            temperature=float(kd_cfg.get("temperature", 1.0)),
+            start_round=int(kd_cfg.get("start_round", 2)),
+        )
+        if knowledge_distillation.weight < 0:
+            raise ValueError("knowledge_distillation.weight must be non-negative.")
+        if knowledge_distillation.temperature <= 0:
+            raise ValueError("knowledge_distillation.temperature must be positive.")
+        if knowledge_distillation.start_round < 2:
+            raise ValueError(
+                "knowledge_distillation.start_round must be at least 2 because "
+                "round 1 has no historical teacher."
+            )
+
     additional_dataset_roots = [
         _resolve_path(project_root, raw_path)
         for raw_path in data_cfg.get("additional_dataset_roots", [])
@@ -193,4 +221,5 @@ def load_config(path: str | Path) -> ExperimentConfig:
         ),
         config_path=config_path,
         federated=federated,
+        knowledge_distillation=knowledge_distillation,
     )

@@ -40,7 +40,7 @@ from redo_by_sara.federated import (
     save_round_history,
     set_base_parameters,
     set_head_state,
-    train_local_model,
+    train_local_model_with_distillation,
 )
 
 
@@ -67,9 +67,28 @@ def _build_wandb_config(
         "num_rounds": federated.num_rounds,
         "local_epochs": federated.local_epochs,
         "client_subjects": client_subjects,
-        "algorithm": "fedper",
+        "algorithm": "fedper_kd",
         "shared_layers": "features",
         "personal_layers": "head",
+        "kd_enabled": bool(
+            config.knowledge_distillation
+            and config.knowledge_distillation.enabled
+        ),
+        "kd_weight": (
+            config.knowledge_distillation.weight
+            if config.knowledge_distillation
+            else 0.0
+        ),
+        "kd_temperature": (
+            config.knowledge_distillation.temperature
+            if config.knowledge_distillation
+            else 1.0
+        ),
+        "kd_start_round": (
+            config.knowledge_distillation.start_round
+            if config.knowledge_distillation
+            else 2
+        ),
     }
 
 
@@ -79,7 +98,7 @@ def _build_run_name(config: ExperimentConfig) -> str:
         raise ValueError("Missing federated config.")
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     return (
-        f"{config.training.task}-flower-"
+        f"{config.training.task}-fedper-kd-"
         f"{federated.num_clients}c-{federated.num_rounds}r-{timestamp}"
     )
 
@@ -118,7 +137,14 @@ def _aggregate_fit_metrics(metrics: list[tuple[int, dict[str, float]]]) -> dict[
         return {}
 
     aggregated: dict[str, float] = {}
-    for key in ("train_loss", "train_score"):
+    for key in (
+        "train_loss",
+        "train_score",
+        "train_supervised_loss",
+        "train_kd_loss",
+        "train_total_loss",
+        "kd_active",
+    ):
         weighted_sum = 0.0
         contributed = False
         for num_examples, client_metrics in metrics:
@@ -305,6 +331,9 @@ def main() -> None:
             )
             self.artifact = torch.load(artifact_path, map_location="cpu", weights_only=False)
             self.head_path = client_head_dir / f"client_{partition.client_id}_head.pt"
+            self.teacher_path = (
+                client_head_dir / f"client_{partition.client_id}_teacher.pt"
+            )
             self.class_ids = client_class_ids(
                 self.artifact,
                 partition.subject_ids,
@@ -356,7 +385,35 @@ def main() -> None:
                 )
                 set_head_state(model, head_state)
             set_base_parameters(model, parameters)
-            train_result = train_local_model(
+
+            server_round = int(config.get("server_round", 1))
+            kd_config = self.experiment.knowledge_distillation
+            use_teacher = bool(
+                kd_config
+                and kd_config.enabled
+                and kd_config.weight > 0
+                and server_round >= kd_config.start_round
+                and self.teacher_path.exists()
+            )
+            teacher_model = None
+            if use_teacher:
+                teacher_model = create_federated_model(
+                    self.artifact,
+                    self.task,
+                    output_dim=(
+                        self.output_dim if self.task == "classification" else None
+                    ),
+                ).to(self.device)
+                teacher_model.load_state_dict(
+                    torch.load(
+                        self.teacher_path,
+                        map_location=self.device,
+                        weights_only=True,
+                    ),
+                    strict=True,
+                )
+
+            train_result = train_local_model_with_distillation(
                 model=model,
                 loader=self.train_loader,
                 task=self.task,
@@ -364,18 +421,35 @@ def main() -> None:
                 epochs=self.local_epochs,
                 learning_rate=self.experiment.training.learning_rate,
                 weight_decay=self.experiment.training.weight_decay,
+                teacher_model=teacher_model,
+                distillation_weight=(kd_config.weight if kd_config else 0.0),
+                temperature=(kd_config.temperature if kd_config else 1.0),
             )
             # Flower may recreate client objects between rounds, so persist the
             # personal head explicitly. Only the base is returned to the server.
             torch.save(get_head_state(model), self.head_path)
+            torch.save(
+                {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                },
+                self.teacher_path,
+            )
             metrics = {
                 "client_id": self.partition.client_id,
-                "train_loss": float(train_result.loss),
-                "train_score": float(train_result.score),
+                "train_loss": float(train_result.evaluation.loss),
+                "train_score": float(train_result.evaluation.score),
+                "train_supervised_loss": float(train_result.supervised_loss),
+                "train_kd_loss": float(train_result.distillation_loss),
+                "train_total_loss": float(train_result.total_loss),
+                "kd_active": float(train_result.distillation_active),
             }
             if self.task == "regression":
                 metrics["train_r2"] = float(
-                    regression_r2_score(train_result.outputs, train_result.targets)
+                    regression_r2_score(
+                        train_result.evaluation.outputs,
+                        train_result.evaluation.targets,
+                    )
                 )
             return get_base_parameters(model), len(self.partition.train_indices), metrics
 
@@ -637,6 +711,14 @@ def main() -> None:
                     client_row["train_score"] = float(metrics["train_score"])
                 if "train_r2" in metrics:
                     client_row["train_r2"] = float(metrics["train_r2"])
+                for key in (
+                    "train_supervised_loss",
+                    "train_kd_loss",
+                    "train_total_loss",
+                    "kd_active",
+                ):
+                    if key in metrics:
+                        client_row[key] = float(metrics[key])
                 self.client_rows.append(client_row)
 
                 if run is not None:
@@ -649,6 +731,16 @@ def main() -> None:
                         client_log_payload[f"clients/{client_id}/train_r2"] = client_row[
                             "train_r2"
                         ]
+                    for key in (
+                        "train_supervised_loss",
+                        "train_kd_loss",
+                        "train_total_loss",
+                        "kd_active",
+                    ):
+                        if key in client_row:
+                            client_log_payload[
+                                f"clients/{client_id}/{key}"
+                            ] = client_row[key]
                     wandb.log(client_log_payload, step=server_round)
 
             row = {"round": float(server_round)}
@@ -656,13 +748,22 @@ def main() -> None:
                 row["train_loss"] = float(aggregated_metrics["train_loss"])
             if "train_score" in aggregated_metrics:
                 row["train_score"] = float(aggregated_metrics["train_score"])
+            for key in (
+                "train_supervised_loss",
+                "train_kd_loss",
+                "train_total_loss",
+                "kd_active",
+            ):
+                if key in aggregated_metrics:
+                    row[key] = float(aggregated_metrics[key])
             self.fit_rows.append(row)
 
             if run is not None and len(row) > 1:
                 wandb.log(
                     {
-                        "federated/train_loss": row.get("train_loss"),
-                        "federated/train_score": row.get("train_score"),
+                        f"federated/{key}": value
+                        for key, value in row.items()
+                        if key != "round"
                     },
                     step=server_round,
                 )
@@ -682,6 +783,7 @@ def main() -> None:
         ),
         min_available_clients=config.federated.num_clients,
         evaluate_fn=evaluate_fn,
+        on_fit_config_fn=lambda server_round: {"server_round": server_round},
         fit_metrics_aggregation_fn=_aggregate_fit_metrics,
         initial_parameters=initial_parameters,
     )
@@ -880,9 +982,30 @@ def main() -> None:
         model_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
-                "algorithm": "fedper",
+                "algorithm": "fedper_kd",
                 "base_state_dict": final_model.features.state_dict(),
                 "client_head_dir": str(client_head_dir),
+                "knowledge_distillation": {
+                    "enabled": bool(
+                        config.knowledge_distillation
+                        and config.knowledge_distillation.enabled
+                    ),
+                    "weight": (
+                        config.knowledge_distillation.weight
+                        if config.knowledge_distillation
+                        else 0.0
+                    ),
+                    "temperature": (
+                        config.knowledge_distillation.temperature
+                        if config.knowledge_distillation
+                        else 1.0
+                    ),
+                    "start_round": (
+                        config.knowledge_distillation.start_round
+                        if config.knowledge_distillation
+                        else 2
+                    ),
+                },
                 "client_local_label_maps": client_label_maps,
             },
             model_path,
@@ -895,11 +1018,32 @@ def main() -> None:
         )
         summary = {
             "task": config.training.task,
-            "algorithm": "fedper",
+            "algorithm": "fedper_kd",
             "partition_mode": "subject_owned_with_optional_shared_subjects",
             "result_name": config.federated.result_name,
             "model_path": str(model_path),
             "client_head_dir": str(client_head_dir),
+            "knowledge_distillation": {
+                "enabled": bool(
+                    config.knowledge_distillation
+                    and config.knowledge_distillation.enabled
+                ),
+                "weight": (
+                    config.knowledge_distillation.weight
+                    if config.knowledge_distillation
+                    else 0.0
+                ),
+                "temperature": (
+                    config.knowledge_distillation.temperature
+                    if config.knowledge_distillation
+                    else 1.0
+                ),
+                "start_round": (
+                    config.knowledge_distillation.start_round
+                    if config.knowledge_distillation
+                    else 2
+                ),
+            },
             "validation_note": (
                 "Uses the aggregated base with each client's saved local head "
                 "and client-local label mapping."

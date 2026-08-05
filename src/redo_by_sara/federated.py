@@ -10,6 +10,7 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from .models import SimpleCNN1D
@@ -75,6 +76,15 @@ class ClientPartition:
     client_id: str
     subject_ids: list[str]
     train_indices: list[int]
+
+
+@dataclass
+class DistillationTrainResult:
+    evaluation: EvalResult
+    supervised_loss: float
+    distillation_loss: float
+    total_loss: float
+    distillation_active: bool
 
 
 def _as_index_list(indices: Sequence[int] | torch.Tensor) -> list[int]:
@@ -372,6 +382,107 @@ def train_local_model(
     for _ in range(epochs):
         run_loader(model, loader, criterion, device, task, optimizer=optimizer)
     return run_loader(model, loader, criterion, device, task, optimizer=None)
+
+
+def _distillation_loss(
+    student_outputs: torch.Tensor,
+    teacher_outputs: torch.Tensor,
+    task: str,
+    temperature: float,
+) -> torch.Tensor:
+    if task == "classification":
+        teacher_probabilities = F.softmax(teacher_outputs / temperature, dim=1)
+        student_log_probabilities = F.log_softmax(
+            student_outputs / temperature,
+            dim=1,
+        )
+        return (
+            F.kl_div(
+                student_log_probabilities,
+                teacher_probabilities,
+                reduction="batchmean",
+            )
+            * temperature**2
+        )
+    if task == "regression":
+        return F.mse_loss(student_outputs, teacher_outputs)
+    raise ValueError(f"Unsupported task: {task}")
+
+
+def train_local_model_with_distillation(
+    model: nn.Module,
+    loader: DataLoader,
+    task: str,
+    device: torch.device,
+    epochs: int,
+    learning_rate: float,
+    weight_decay: float,
+    teacher_model: nn.Module | None,
+    distillation_weight: float,
+    temperature: float,
+) -> DistillationTrainResult:
+    """Train the current client model while keeping its historical teacher frozen."""
+    criterion = _criterion_for_task(task)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+    distillation_active = teacher_model is not None and distillation_weight > 0
+    if teacher_model is not None:
+        teacher_model.eval()
+        teacher_model.requires_grad_(False)
+
+    supervised_sum = 0.0
+    distillation_sum = 0.0
+    total_sum = 0.0
+    example_count = 0
+
+    model.train()
+    for _ in range(epochs):
+        for x, y in loader:
+            x = x.to(device)
+            y = y.to(device)
+            optimizer.zero_grad()
+
+            student_outputs = model(x)
+            if task == "regression":
+                student_outputs = student_outputs.float()
+                y = y.float()
+            supervised_loss = criterion(student_outputs, y)
+
+            kd_loss = torch.zeros((), device=device)
+            if distillation_active:
+                with torch.no_grad():
+                    teacher_outputs = teacher_model(x)
+                    if task == "regression":
+                        teacher_outputs = teacher_outputs.float()
+                kd_loss = _distillation_loss(
+                    student_outputs=student_outputs,
+                    teacher_outputs=teacher_outputs,
+                    task=task,
+                    temperature=temperature,
+                )
+
+            total_loss = supervised_loss + distillation_weight * kd_loss
+            total_loss.backward()
+            optimizer.step()
+
+            batch_size = int(x.shape[0])
+            supervised_sum += float(supervised_loss.detach()) * batch_size
+            distillation_sum += float(kd_loss.detach()) * batch_size
+            total_sum += float(total_loss.detach()) * batch_size
+            example_count += batch_size
+
+    evaluation = evaluate_model(model, loader, task, device)
+    denominator = max(example_count, 1)
+    return DistillationTrainResult(
+        evaluation=evaluation,
+        supervised_loss=supervised_sum / denominator,
+        distillation_loss=distillation_sum / denominator,
+        total_loss=total_sum / denominator,
+        distillation_active=distillation_active,
+    )
 
 
 def evaluate_model(
