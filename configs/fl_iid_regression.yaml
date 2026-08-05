@@ -43,6 +43,7 @@ training:
   num_workers: 0
 
 federated:
+  result_name: fedper_kd
   num_clients: 3
   num_rounds: 5
   local_epochs: 1
@@ -51,9 +52,15 @@ federated:
   client_num_cpus: 1.0
   client_num_gpus: 0.0
 
+knowledge_distillation:
+  enabled: true
+  weight: 0.5
+  temperature: 2.0
+  start_round: 2
+
 wandb:
   enabled: true
   project: ENGR859-final-project
   entity: null
-  tags: ["flower", "iid", "regression", "raw-vibration"]
+  tags: ["flower", "iid", "regression", "raw-vibration", "fedper-kd"]
   watch: false

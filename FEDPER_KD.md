@@ -29,6 +29,14 @@ Run an experiment as usual, for example:
 python scripts/run_flower.py --config configs/fl_classification.yaml
 ```
 
+For genuine IID FedPerKD, use the IID entry point. It assigns whole training
+runs from every subject across clients while leaving validation and test runs
+globally held out:
+
+```bash
+python scripts/run_flower_iid.py --config configs/fl_iid_classification.yaml
+```
+
 W&B records `train_supervised_loss`, `train_kd_loss`, `train_total_loss`, and
 `kd_active` at both the client and federated levels. `train_loss` remains the
 ordinary supervised evaluation loss so comparisons with the FedPer baseline

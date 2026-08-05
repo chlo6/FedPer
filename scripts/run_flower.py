@@ -42,12 +42,17 @@ from redo_by_sara.federated import (
     set_head_state,
     train_local_model_with_distillation,
 )
+from redo_by_sara.iid_partitioning import (
+    build_iid_run_partitions,
+    create_iid_partition_summary,
+)
 
 
 def _build_wandb_config(
     config: ExperimentConfig,
     artifact: dict[str, object],
     client_subjects: dict[str, list[str]],
+    iid_mode: bool = False,
 ) -> dict[str, Any]:
     federated = config.federated
     if federated is None:
@@ -55,6 +60,11 @@ def _build_wandb_config(
     return {
         "seed": config.seed,
         "task": config.training.task,
+        "partition_mode": (
+            "iid_by_subject_full_train_runs"
+            if iid_mode
+            else "subject_owned_with_optional_shared_subjects"
+        ),
         "artifact_name": config.artifact_name,
         "dataset_root": str(config.data.dataset_root),
         "selected_sensors": config.data.selected_sensors,
@@ -92,13 +102,13 @@ def _build_wandb_config(
     }
 
 
-def _build_run_name(config: ExperimentConfig) -> str:
+def _build_run_name(config: ExperimentConfig, iid_mode: bool = False) -> str:
     federated = config.federated
     if federated is None:
         raise ValueError("Missing federated config.")
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     return (
-        f"{config.training.task}-fedper-kd-"
+        f"{config.training.task}-fedper-kd-{'iid-' if iid_mode else ''}"
         f"{federated.num_clients}c-{federated.num_rounds}r-{timestamp}"
     )
 
@@ -107,6 +117,7 @@ def _init_wandb(
     config: ExperimentConfig,
     artifact: dict[str, object],
     client_subjects: dict[str, list[str]],
+    iid_mode: bool = False,
 ) -> wandb.sdk.wandb_run.Run | None:
     if not config.wandb.enabled:
         return None
@@ -114,9 +125,16 @@ def _init_wandb(
     run = wandb.init(
         project=config.wandb.project,
         entity=config.wandb.entity,
-        tags=(config.wandb.tags or []) + ["flower", "federated-learning"],
-        config=_build_wandb_config(config, artifact, client_subjects),
-        name=_build_run_name(config),
+        tags=(config.wandb.tags or [])
+        + ["flower", "federated-learning", "fedper-kd"]
+        + (["iid"] if iid_mode else []),
+        config=_build_wandb_config(
+            config,
+            artifact,
+            client_subjects,
+            iid_mode=iid_mode,
+        ),
+        name=_build_run_name(config, iid_mode=iid_mode),
         job_type="federated-train",
     )
 
@@ -234,18 +252,25 @@ def _coerce_ndarrays(parameters: Any, parameters_to_ndarrays: Any) -> list[Any]:
     return parameters_to_ndarrays(parameters)
 
 
-def _result_stem(config: ExperimentConfig) -> str:
+def _result_stem(config: ExperimentConfig, iid_mode: bool = False) -> str:
     federated = config.federated
     if federated is None:
         raise ValueError("Missing federated config.")
     suffix = f"_{federated.result_name}" if federated.result_name else ""
-    return f"{config.training.task}{suffix}"
+    iid_suffix = "_iid" if iid_mode else ""
+    return f"{config.training.task}{iid_suffix}{suffix}"
 
 
-def main() -> None:
+def main(force_iid: bool = False) -> None:
     parser = argparse.ArgumentParser(description="Run a Flower federated-learning sandbox.")
     parser.add_argument("--config", required=True, help="Path to YAML config file.")
+    parser.add_argument(
+        "--iid",
+        action="store_true",
+        help="Give every client whole training runs from every subject.",
+    )
     args = parser.parse_args()
+    iid_mode = force_iid or args.iid
 
     config = load_config(args.config)
     if config.federated is None:
@@ -263,16 +288,31 @@ def main() -> None:
         ) from exc
 
     artifact = load_validated_artifact(config.artifact_path, config)
-    client_partitions, client_subjects = build_client_partitions(
-        artifact=artifact,
-        num_clients=config.federated.num_clients,
-        client_subjects=config.federated.client_subjects,
-    )
+    if iid_mode:
+        client_partitions, client_subjects = build_iid_run_partitions(
+            artifact=artifact,
+            num_clients=config.federated.num_clients,
+            seed=config.seed,
+        )
+    else:
+        client_partitions, client_subjects = build_client_partitions(
+            artifact=artifact,
+            num_clients=config.federated.num_clients,
+            client_subjects=config.federated.client_subjects,
+        )
     partitions_by_id = {partition.client_id: partition for partition in client_partitions}
-    partition_summary = create_partition_summary(
-        artifact=artifact,
-        client_partitions=client_partitions,
-        client_subjects=client_subjects,
+    partition_summary = (
+        create_iid_partition_summary(
+            artifact=artifact,
+            client_partitions=client_partitions,
+            client_subjects=client_subjects,
+        )
+        if iid_mode
+        else create_partition_summary(
+            artifact=artifact,
+            client_partitions=client_partitions,
+            client_subjects=client_subjects,
+        )
     )
     client_label_maps = {
         partition.client_id: client_local_label_map(
@@ -283,7 +323,7 @@ def main() -> None:
     }
     partition_summary["client_local_label_maps"] = client_label_maps
 
-    result_stem = _result_stem(config)
+    result_stem = _result_stem(config, iid_mode=iid_mode)
     partition_summary_path = config.output_dir / f"{result_stem}_federated_partitions.json"
     history_path = config.output_dir / f"{result_stem}_federated_history.csv"
     client_history_path = config.output_dir / f"{result_stem}_federated_client_history.csv"
@@ -309,7 +349,12 @@ def main() -> None:
 
     save_partition_summary(partition_summary_path, partition_summary)
 
-    run = _init_wandb(config, artifact, client_subjects)
+    run = _init_wandb(
+        config,
+        artifact,
+        client_subjects,
+        iid_mode=iid_mode,
+    )
 
     class FlowerSubjectClient(NumPyClient):
         def __init__(
@@ -1019,7 +1064,11 @@ def main() -> None:
         summary = {
             "task": config.training.task,
             "algorithm": "fedper_kd",
-            "partition_mode": "subject_owned_with_optional_shared_subjects",
+            "partition_mode": (
+                "iid_by_subject_full_train_runs"
+                if iid_mode
+                else "subject_owned_with_optional_shared_subjects"
+            ),
             "result_name": config.federated.result_name,
             "model_path": str(model_path),
             "client_head_dir": str(client_head_dir),
