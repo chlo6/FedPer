@@ -43,7 +43,7 @@ training:
   num_workers: 0
 
 federated:
-  result_name: semi_non_iid
+  result_name: semi_non_iid_fedavg_kd
   num_clients: 2
   num_rounds: 5
   local_epochs: 1
@@ -55,9 +55,15 @@ federated:
     "0": ["1", "2", "8"]
     "1": ["3", "4", "5", "7", "8"]
 
+knowledge_distillation:
+  enabled: true
+  weight: 0.5
+  temperature: 2.0
+  start_round: 2
+
 wandb:
   enabled: false
   project: ENGR859-final-project
   entity: null
-  tags: ["semi-non-iid", "regression"]
+  tags: ["semi-non-iid", "regression", "fedavg-kd"]
   watch: true

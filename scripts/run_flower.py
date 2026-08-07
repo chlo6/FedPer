@@ -30,7 +30,11 @@ from redo_by_sara.federated import (
     save_partition_summary,
     save_round_history,
     set_parameters,
-    train_local_model,
+    train_local_model_with_distillation,
+)
+from redo_by_sara.iid_partitioning import (
+    build_iid_run_partitions,
+    create_iid_partition_summary,
 )
 
 
@@ -38,6 +42,7 @@ def _build_wandb_config(
     config: ExperimentConfig,
     artifact: dict[str, object],
     client_subjects: dict[str, list[str]],
+    iid_mode: bool = False,
 ) -> dict[str, Any]:
     federated = config.federated
     if federated is None:
@@ -45,6 +50,11 @@ def _build_wandb_config(
     return {
         "seed": config.seed,
         "task": config.training.task,
+        "partition_mode": (
+            "iid_by_subject_full_train_runs"
+            if iid_mode
+            else "subject_owned_with_optional_shared_subjects"
+        ),
         "artifact_name": config.artifact_name,
         "dataset_root": str(config.data.dataset_root),
         "selected_sensors": config.data.selected_sensors,
@@ -57,17 +67,36 @@ def _build_wandb_config(
         "num_rounds": federated.num_rounds,
         "local_epochs": federated.local_epochs,
         "client_subjects": client_subjects,
-        "algorithm": "fedavg",
+        "algorithm": "fedavg_kd",
+        "kd_enabled": bool(
+            config.knowledge_distillation
+            and config.knowledge_distillation.enabled
+        ),
+        "kd_weight": (
+            config.knowledge_distillation.weight
+            if config.knowledge_distillation
+            else 0.0
+        ),
+        "kd_temperature": (
+            config.knowledge_distillation.temperature
+            if config.knowledge_distillation
+            else 1.0
+        ),
+        "kd_start_round": (
+            config.knowledge_distillation.start_round
+            if config.knowledge_distillation
+            else 2
+        ),
     }
 
 
-def _build_run_name(config: ExperimentConfig) -> str:
+def _build_run_name(config: ExperimentConfig, iid_mode: bool = False) -> str:
     federated = config.federated
     if federated is None:
         raise ValueError("Missing federated config.")
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     return (
-        f"{config.training.task}-flower-"
+        f"{config.training.task}-fedavg-kd-{'iid-' if iid_mode else ''}"
         f"{federated.num_clients}c-{federated.num_rounds}r-{timestamp}"
     )
 
@@ -76,6 +105,7 @@ def _init_wandb(
     config: ExperimentConfig,
     artifact: dict[str, object],
     client_subjects: dict[str, list[str]],
+    iid_mode: bool = False,
 ) -> wandb.sdk.wandb_run.Run | None:
     if not config.wandb.enabled:
         return None
@@ -83,9 +113,13 @@ def _init_wandb(
     run = wandb.init(
         project=config.wandb.project,
         entity=config.wandb.entity,
-        tags=(config.wandb.tags or []) + ["flower", "federated-learning"],
-        config=_build_wandb_config(config, artifact, client_subjects),
-        name=_build_run_name(config),
+        tags=(config.wandb.tags or [])
+        + ["flower", "federated-learning", "fedavg-kd"]
+        + (["iid"] if iid_mode else []),
+        config=_build_wandb_config(
+            config, artifact, client_subjects, iid_mode=iid_mode
+        ),
+        name=_build_run_name(config, iid_mode=iid_mode),
         job_type="federated-train",
     )
 
@@ -106,7 +140,15 @@ def _aggregate_fit_metrics(metrics: list[tuple[int, dict[str, float]]]) -> dict[
         return {}
 
     aggregated: dict[str, float] = {}
-    for key in ("train_loss", "train_score"):
+    for key in (
+        "train_loss",
+        "train_score",
+        "train_r2",
+        "train_supervised_loss",
+        "train_kd_loss",
+        "train_total_loss",
+        "kd_active",
+    ):
         weighted_sum = 0.0
         contributed = False
         for num_examples, client_metrics in metrics:
@@ -141,18 +183,21 @@ def _coerce_ndarrays(parameters: Any, parameters_to_ndarrays: Any) -> list[Any]:
     return parameters_to_ndarrays(parameters)
 
 
-def _result_stem(config: ExperimentConfig) -> str:
+def _result_stem(config: ExperimentConfig, iid_mode: bool = False) -> str:
     federated = config.federated
     if federated is None:
         raise ValueError("Missing federated config.")
     suffix = f"_{federated.result_name}" if federated.result_name else ""
-    return f"{config.training.task}{suffix}"
+    iid_suffix = "_iid" if iid_mode else ""
+    return f"{config.training.task}{iid_suffix}{suffix}"
 
 
-def main() -> None:
+def main(force_iid: bool = False) -> None:
     parser = argparse.ArgumentParser(description="Run a Flower federated-learning sandbox.")
     parser.add_argument("--config", required=True, help="Path to YAML config file.")
+    parser.add_argument("--iid", action="store_true", help="Use whole-run IID clients.")
     args = parser.parse_args()
+    iid_mode = force_iid or args.iid
 
     config = load_config(args.config)
     if config.federated is None:
@@ -170,28 +215,49 @@ def main() -> None:
         ) from exc
 
     artifact = load_validated_artifact(config.artifact_path, config)
-    client_partitions, client_subjects = build_client_partitions(
-        artifact=artifact,
-        num_clients=config.federated.num_clients,
-        client_subjects=config.federated.client_subjects,
-    )
+    if iid_mode:
+        client_partitions, client_subjects = build_iid_run_partitions(
+            artifact=artifact,
+            num_clients=config.federated.num_clients,
+            seed=config.seed,
+        )
+    else:
+        client_partitions, client_subjects = build_client_partitions(
+            artifact=artifact,
+            num_clients=config.federated.num_clients,
+            client_subjects=config.federated.client_subjects,
+        )
     partitions_by_id = {partition.client_id: partition for partition in client_partitions}
-    partition_summary = create_partition_summary(
-        artifact=artifact,
-        client_partitions=client_partitions,
-        client_subjects=client_subjects,
+    partition_summary = (
+        create_iid_partition_summary(
+            artifact=artifact,
+            client_partitions=client_partitions,
+            client_subjects=client_subjects,
+        )
+        if iid_mode
+        else create_partition_summary(
+            artifact=artifact,
+            client_partitions=client_partitions,
+            client_subjects=client_subjects,
+        )
     )
 
-    result_stem = _result_stem(config)
+    result_stem = _result_stem(config, iid_mode=iid_mode)
     partition_summary_path = config.output_dir / f"{result_stem}_federated_partitions.json"
     history_path = config.output_dir / f"{result_stem}_federated_history.csv"
     client_history_path = config.output_dir / f"{result_stem}_federated_client_history.csv"
     summary_path = config.output_dir / f"{result_stem}_federated_summary.json"
     model_path = config.output_dir / f"{result_stem}_flower_model.pt"
 
+    experiment_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S-%f")
+    teacher_dir = config.output_dir / "fedavg_kd_teachers" / result_stem / experiment_id
+    teacher_dir.mkdir(parents=True, exist_ok=False)
+
     save_partition_summary(partition_summary_path, partition_summary)
 
-    run = _init_wandb(config, artifact, client_subjects)
+    run = _init_wandb(
+        config, artifact, client_subjects, iid_mode=iid_mode
+    )
 
     class FlowerSubjectClient(NumPyClient):
         def __init__(
@@ -212,6 +278,7 @@ def main() -> None:
                 else "cpu"
             )
             self.artifact = torch.load(artifact_path, map_location="cpu", weights_only=False)
+            self.teacher_path = teacher_dir / f"client_{partition.client_id}_teacher.pt"
             self.train_loader = build_loader(
                 artifact=self.artifact,
                 indices=self.partition.train_indices,
@@ -233,7 +300,31 @@ def main() -> None:
         ) -> tuple[list[Any], int, dict[str, float]]:
             model = create_federated_model(self.artifact, self.task).to(self.device)
             set_parameters(model, parameters)
-            train_result = train_local_model(
+            server_round = int(config.get("server_round", 1))
+            kd_config = self.experiment.knowledge_distillation
+            use_teacher = bool(
+                kd_config
+                and kd_config.enabled
+                and kd_config.weight > 0
+                and server_round >= kd_config.start_round
+                and self.teacher_path.exists()
+            )
+            teacher_model = None
+            if use_teacher:
+                teacher_model = create_federated_model(
+                    self.artifact,
+                    self.task,
+                ).to(self.device)
+                teacher_model.load_state_dict(
+                    torch.load(
+                        self.teacher_path,
+                        map_location=self.device,
+                        weights_only=True,
+                    ),
+                    strict=True,
+                )
+
+            train_result = train_local_model_with_distillation(
                 model=model,
                 loader=self.train_loader,
                 task=self.task,
@@ -241,15 +332,32 @@ def main() -> None:
                 epochs=self.local_epochs,
                 learning_rate=self.experiment.training.learning_rate,
                 weight_decay=self.experiment.training.weight_decay,
+                teacher_model=teacher_model,
+                distillation_weight=(kd_config.weight if kd_config else 0.0),
+                temperature=(kd_config.temperature if kd_config else 1.0),
+            )
+            torch.save(
+                {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                },
+                self.teacher_path,
             )
             metrics = {
                 "client_id": self.partition.client_id,
-                "train_loss": float(train_result.loss),
-                "train_score": float(train_result.score),
+                "train_loss": float(train_result.evaluation.loss),
+                "train_score": float(train_result.evaluation.score),
+                "train_supervised_loss": float(train_result.supervised_loss),
+                "train_kd_loss": float(train_result.distillation_loss),
+                "train_total_loss": float(train_result.total_loss),
+                "kd_active": float(train_result.distillation_active),
             }
             if self.task == "regression":
                 metrics["train_r2"] = float(
-                    regression_r2_score(train_result.outputs, train_result.targets)
+                    regression_r2_score(
+                        train_result.evaluation.outputs,
+                        train_result.evaluation.targets,
+                    )
                 )
             return get_parameters(model), len(self.partition.train_indices), metrics
 
@@ -327,6 +435,14 @@ def main() -> None:
                     client_row["train_score"] = float(metrics["train_score"])
                 if "train_r2" in metrics:
                     client_row["train_r2"] = float(metrics["train_r2"])
+                for key in (
+                    "train_supervised_loss",
+                    "train_kd_loss",
+                    "train_total_loss",
+                    "kd_active",
+                ):
+                    if key in metrics:
+                        client_row[key] = float(metrics[key])
                 self.client_rows.append(client_row)
 
                 if run is not None:
@@ -339,6 +455,16 @@ def main() -> None:
                         client_log_payload[f"clients/{client_id}/train_r2"] = client_row[
                             "train_r2"
                         ]
+                    for key in (
+                        "train_supervised_loss",
+                        "train_kd_loss",
+                        "train_total_loss",
+                        "kd_active",
+                    ):
+                        if key in client_row:
+                            client_log_payload[
+                                f"clients/{client_id}/{key}"
+                            ] = client_row[key]
                     wandb.log(client_log_payload, step=server_round)
 
             row = {"round": float(server_round)}
@@ -346,13 +472,24 @@ def main() -> None:
                 row["train_loss"] = float(aggregated_metrics["train_loss"])
             if "train_score" in aggregated_metrics:
                 row["train_score"] = float(aggregated_metrics["train_score"])
+            if "train_r2" in aggregated_metrics:
+                row["train_r2"] = float(aggregated_metrics["train_r2"])
+            for key in (
+                "train_supervised_loss",
+                "train_kd_loss",
+                "train_total_loss",
+                "kd_active",
+            ):
+                if key in aggregated_metrics:
+                    row[key] = float(aggregated_metrics[key])
             self.fit_rows.append(row)
 
             if run is not None and len(row) > 1:
                 wandb.log(
                     {
-                        "federated/train_loss": row.get("train_loss"),
-                        "federated/train_score": row.get("train_score"),
+                        f"federated/{key}": value
+                        for key, value in row.items()
+                        if key != "round"
                     },
                     step=server_round,
                 )
@@ -372,6 +509,7 @@ def main() -> None:
         ),
         min_available_clients=config.federated.num_clients,
         evaluate_fn=evaluate_fn,
+        on_fit_config_fn=lambda server_round: {"server_round": server_round},
         fit_metrics_aggregation_fn=_aggregate_fit_metrics,
         initial_parameters=initial_parameters,
     )
@@ -448,10 +586,36 @@ def main() -> None:
         )
         summary = {
             "task": config.training.task,
-            "algorithm": "fedavg",
-            "partition_mode": "subject_owned_with_optional_shared_subjects",
+            "algorithm": "fedavg_kd",
+            "partition_mode": (
+                "iid_by_subject_full_train_runs"
+                if iid_mode
+                else "subject_owned_with_optional_shared_subjects"
+            ),
             "result_name": config.federated.result_name,
             "model_path": str(model_path),
+            "teacher_model_dir": str(teacher_dir),
+            "knowledge_distillation": {
+                "enabled": bool(
+                    config.knowledge_distillation
+                    and config.knowledge_distillation.enabled
+                ),
+                "weight": (
+                    config.knowledge_distillation.weight
+                    if config.knowledge_distillation
+                    else 0.0
+                ),
+                "temperature": (
+                    config.knowledge_distillation.temperature
+                    if config.knowledge_distillation
+                    else 1.0
+                ),
+                "start_round": (
+                    config.knowledge_distillation.start_round
+                    if config.knowledge_distillation
+                    else 2
+                ),
+            },
             "history_path": str(history_path),
             "client_history_path": str(client_history_path),
             "partition_summary_path": str(partition_summary_path),
