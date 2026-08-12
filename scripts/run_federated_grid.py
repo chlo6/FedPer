@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
+import json
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +99,99 @@ def _build_run_config(
     return payload, result_name
 
 
+def _find_run_summary(output_dir: Path, result_name: str) -> Path:
+    matches = list(output_dir.glob(f"*{result_name}*federated_summary.json"))
+    if not matches:
+        raise FileNotFoundError(
+            f"No federated summary was found for result_name={result_name}."
+        )
+    return max(matches, key=lambda path: path.stat().st_mtime_ns)
+
+
+def _collect_metrics(
+    summary_path: Path,
+    rounds: int,
+    local_epochs: int,
+    result_name: str,
+) -> dict[str, Any]:
+    summary = json.loads(summary_path.read_text())
+    return {
+        "result_name": result_name,
+        "rounds": rounds,
+        "local_epochs": local_epochs,
+        "status": "completed",
+        "best_val_round": summary.get("best_val_round"),
+        "best_val_loss": summary.get("best_val_loss"),
+        "best_val_score": summary.get("best_val_score"),
+        "best_val_r2": summary.get("best_val_r2"),
+        "test_loss": summary.get("test_loss"),
+        "test_score": summary.get("test_score"),
+        "test_r2": summary.get("test_r2"),
+        "summary_path": str(summary_path),
+    }
+
+
+def _metric_text(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
+
+
+def _print_final_table(rows: list[dict[str, Any]], task: str) -> None:
+    score_label = "test_accuracy" if task == "classification" else "test_rmse"
+    columns = [
+        ("rounds", "rounds"),
+        ("epochs", "local_epochs"),
+        ("status", "status"),
+        ("val_loss", "best_val_loss"),
+        ("val_score", "best_val_score"),
+        ("test_loss", "test_loss"),
+        (score_label, "test_score"),
+    ]
+    if task == "regression":
+        columns.append(("test_r2", "test_r2"))
+
+    widths = {
+        label: max(
+            len(label),
+            *(len(_metric_text(row.get(key))) for row in rows),
+        )
+        for label, key in columns
+    }
+    print("\nFINAL GRID RESULTS")
+    print("  ".join(label.ljust(widths[label]) for label, _ in columns))
+    print("  ".join("-" * widths[label] for label, _ in columns))
+    for row in rows:
+        print(
+            "  ".join(
+                _metric_text(row.get(key)).ljust(widths[label])
+                for label, key in columns
+            )
+        )
+
+
+def _save_grid_summary(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    base_name: str,
+) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = output_dir / f"{base_name}_grid_summary_{timestamp}"
+    json_path = stem.with_suffix(".json")
+    csv_path = stem.with_suffix(".csv")
+    json_path.write_text(json.dumps(rows, indent=2))
+
+    fieldnames = list(rows[0]) if rows else []
+    with csv_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return csv_path, json_path
+
+
 def main() -> None:
     args = _parse_args()
     _validate_positive(args.rounds, "--rounds")
@@ -109,6 +205,16 @@ def main() -> None:
         raise FileNotFoundError(f"Runner not found: {runner_path}")
 
     source: dict[str, Any] = yaml.safe_load(config_path.read_text())
+    task = str(source.get("training", {}).get("task", "unknown"))
+    output_dir_raw = Path(str(source.get("output_dir", "artifacts")))
+    output_dir = (
+        output_dir_raw
+        if output_dir_raw.is_absolute()
+        else (ROOT / output_dir_raw).resolve()
+    )
+    base_name = (
+        source.get("federated", {}).get("result_name") or config_path.stem
+    )
     combinations = [
         (rounds, local_epochs)
         for rounds in args.rounds
@@ -119,6 +225,8 @@ def main() -> None:
         f"{runner_path.relative_to(ROOT)}"
     )
 
+    rows: list[dict[str, Any]] = []
+    pending_error: str | None = None
     for index, (rounds, local_epochs) in enumerate(combinations, start=1):
         payload, result_name = _build_run_config(
             source,
@@ -172,7 +280,64 @@ def main() -> None:
             if args.continue_on_error:
                 print(f"WARNING: {message}", file=sys.stderr)
             else:
-                raise SystemExit(message)
+                pending_error = message
+            rows.append(
+                {
+                    "result_name": result_name,
+                    "rounds": rounds,
+                    "local_epochs": local_epochs,
+                    "status": "failed",
+                    "best_val_round": None,
+                    "best_val_loss": None,
+                    "best_val_score": None,
+                    "best_val_r2": None,
+                    "test_loss": None,
+                    "test_score": None,
+                    "test_r2": None,
+                    "summary_path": None,
+                }
+            )
+            if pending_error is not None:
+                break
+            continue
+
+        try:
+            summary_path = _find_run_summary(output_dir, result_name)
+            rows.append(
+                _collect_metrics(
+                    summary_path,
+                    rounds,
+                    local_epochs,
+                    result_name,
+                )
+            )
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            rows.append(
+                {
+                    "result_name": result_name,
+                    "rounds": rounds,
+                    "local_epochs": local_epochs,
+                    "status": "summary-missing",
+                    "best_val_round": None,
+                    "best_val_loss": None,
+                    "best_val_score": None,
+                    "best_val_r2": None,
+                    "test_loss": None,
+                    "test_score": None,
+                    "test_r2": None,
+                    "summary_path": None,
+                }
+            )
+            print(f"WARNING: {exc}", file=sys.stderr)
+
+    if not args.dry_run and rows:
+        _print_final_table(rows, task)
+        csv_path, json_path = _save_grid_summary(rows, output_dir, str(base_name))
+        print(f"\nSaved grid CSV:  {csv_path}")
+        print(f"Saved grid JSON: {json_path}")
+
+    if pending_error is not None:
+        raise SystemExit(pending_error)
 
 
 if __name__ == "__main__":

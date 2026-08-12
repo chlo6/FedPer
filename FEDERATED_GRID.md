@@ -9,6 +9,11 @@ It creates a temporary YAML file for each experiment and leaves the source
 configuration unchanged. Every experiment receives a unique `result_name` and
 the W&B tags `grid-search`, `<N>-rounds`, and `<N>-local-epoch(s)`.
 
+After the grid finishes, it prints a compact table containing validation loss,
+validation score, test loss, test accuracy or RMSE, and regression test $R^2$
+when applicable. The same results are saved under `artifacts/` as timestamped
+`*_grid_summary_*.csv` and `*_grid_summary_*.json` files.
+
 Subject-partitioned example:
 
 ```bash
