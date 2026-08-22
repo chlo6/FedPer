@@ -16,12 +16,16 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# This 4 x 3 grid spans weak through strong distillation without becoming
-# prohibitively large. T=1 is unsoftened; T=2 and T=4 progressively expose
-# more of the historical teacher's class-probability structure.
-DEFAULT_WEIGHTS = [0.1, 0.25, 0.5, 1.0]
-DEFAULT_TEMPERATURES = [1.0, 2.0, 4.0]
-DEFAULT_START_ROUNDS = [2]
+CLASSIFICATION_DEFAULT_WEIGHTS = [0.1, 0.25, 0.5, 1.0]
+CLASSIFICATION_DEFAULT_TEMPERATURES = [1.0, 2.0, 4.0]
+CLASSIFICATION_DEFAULT_START_ROUNDS = [2]
+
+# Regression distillation compares scalar teacher/student predictions with
+# MSE, so softmax temperature has no effect. Sweep when distillation starts
+# instead, as well as a slightly wider range of KD weights.
+REGRESSION_DEFAULT_WEIGHTS = [0.1, 0.25, 0.5, 1.0, 2.0]
+REGRESSION_DEFAULT_TEMPERATURES = [1.0]
+REGRESSION_DEFAULT_START_ROUNDS = [2, 5, 10]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -39,13 +43,16 @@ def _parse_args() -> argparse.Namespace:
         help="Use run_flower_iid.py for IID or run_flower.py for non-IID.",
     )
     parser.add_argument(
-        "--weights", nargs="+", type=float, default=DEFAULT_WEIGHTS
+        "--weights", nargs="+", type=float, default=None,
+        help="KD weights. Defaults depend on the task in the config.",
     )
     parser.add_argument(
-        "--temperatures", nargs="+", type=float, default=DEFAULT_TEMPERATURES
+        "--temperatures", nargs="+", type=float, default=None,
+        help="KD temperatures. Regression is fixed at 1 because it uses MSE KD.",
     )
     parser.add_argument(
-        "--start-rounds", nargs="+", type=int, default=DEFAULT_START_ROUNDS
+        "--start-rounds", nargs="+", type=int, default=None,
+        help="Rounds at which KD begins. Defaults depend on the task.",
     )
     parser.add_argument(
         "--rounds",
@@ -83,6 +90,33 @@ def _validate_values(
         raise ValueError("--temperatures must contain positive values.")
     if not start_rounds or any(start_round < 2 for start_round in start_rounds):
         raise ValueError("--start-rounds must be at least 2; round 1 has no teacher.")
+
+
+def _resolve_sweep_values(
+    task: str,
+    weights: list[float] | None,
+    temperatures: list[float] | None,
+    start_rounds: list[int] | None,
+) -> tuple[list[float], list[float], list[int]]:
+    if task == "classification":
+        return (
+            weights or CLASSIFICATION_DEFAULT_WEIGHTS,
+            temperatures or CLASSIFICATION_DEFAULT_TEMPERATURES,
+            start_rounds or CLASSIFICATION_DEFAULT_START_ROUNDS,
+        )
+    if task == "regression":
+        resolved_temperatures = temperatures or REGRESSION_DEFAULT_TEMPERATURES
+        if any(temperature != 1.0 for temperature in resolved_temperatures):
+            raise ValueError(
+                "Regression KD uses MSE between scalar predictions, so "
+                "temperature has no effect. Use --temperatures 1."
+            )
+        return (
+            weights or REGRESSION_DEFAULT_WEIGHTS,
+            resolved_temperatures,
+            start_rounds or REGRESSION_DEFAULT_START_ROUNDS,
+        )
+    raise ValueError(f"Unsupported training task for KD sweep: {task!r}.")
 
 
 def _number_token(value: float) -> str:
@@ -284,7 +318,6 @@ def _save_summary(
 
 def main() -> None:
     args = _parse_args()
-    _validate_values(args.weights, args.temperatures, args.start_rounds)
     if args.rounds is not None and args.rounds < 1:
         raise ValueError("--rounds must be positive.")
     if args.local_epochs is not None and args.local_epochs < 1:
@@ -298,6 +331,10 @@ def main() -> None:
 
     source: dict[str, Any] = yaml.safe_load(config_path.read_text())
     task = str(source.get("training", {}).get("task", "unknown"))
+    weights, temperatures, start_rounds = _resolve_sweep_values(
+        task, args.weights, args.temperatures, args.start_rounds
+    )
+    _validate_values(weights, temperatures, start_rounds)
     federated = source.get("federated", {})
     rounds = (
         args.rounds
@@ -321,12 +358,12 @@ def main() -> None:
     base_name = federated.get("result_name") or config_path.stem
     combinations = [
         (weight, temperature, start_round)
-        for weight in args.weights
-        for temperature in args.temperatures
-        for start_round in args.start_rounds
+        for weight in weights
+        for temperature in temperatures
+        for start_round in start_rounds
     ]
     print(
-        f"Running {len(combinations)} KD configurations with "
+        f"Running {len(combinations)} {task} KD configurations with "
         f"{runner_path.relative_to(ROOT)}; rounds={rounds}, "
         f"local_epochs={local_epochs}"
     )
