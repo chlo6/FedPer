@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.run_kd_sweep import _build_run_config, _validate_values
+from scripts.run_kd_sweep import (
+    _build_run_config,
+    _resolve_sweep_values,
+    _validate_values,
+)
 
 
 def _source() -> dict[str, object]:
@@ -53,3 +57,17 @@ def test_invalid_sweep_values_fail_early() -> None:
 def test_start_round_cannot_exceed_training_rounds() -> None:
     with pytest.raises(ValueError):
         _build_run_config(_source(), "unused", 0.5, 2.0, 31)
+
+
+def test_regression_defaults_sweep_weight_and_start_round_only() -> None:
+    weights, temperatures, start_rounds = _resolve_sweep_values(
+        "regression", None, None, None
+    )
+    assert weights == [0.1, 0.25, 0.5, 1.0, 2.0]
+    assert temperatures == [1.0]
+    assert start_rounds == [2, 5, 10]
+
+
+def test_regression_rejects_meaningless_temperature_sweep() -> None:
+    with pytest.raises(ValueError, match="temperature has no effect"):
+        _resolve_sweep_values("regression", None, [1.0, 2.0], None)
