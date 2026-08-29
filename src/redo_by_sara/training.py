@@ -39,7 +39,9 @@ class ArtifactDataset(Dataset):
         x = (x - self.mean.squeeze(0)) / self.std.squeeze(0)
         y = self.targets[item_index]
         if self.task == "regression":
-            y = y.unsqueeze(0)
+            # Accept either scalar targets ([N]) or one-element targets
+            # ([N, 1]) without introducing an extra batch-broadcast dimension.
+            y = y.reshape(1)
         return x.float(), y
 
 
@@ -49,6 +51,7 @@ class EvalResult:
     score: float
     outputs: torch.Tensor
     targets: torch.Tensor
+    r2: float | None = None
 
 
 MetricLogger = Callable[[dict[str, float]], None]
@@ -90,6 +93,14 @@ def _regression_score(predictions: torch.Tensor, targets: torch.Tensor) -> float
     return torch.sqrt(torch.mean((predictions - targets) ** 2)).item()
 
 
+def _regression_r2(predictions: torch.Tensor, targets: torch.Tensor) -> float:
+    residual_sum = torch.sum((targets - predictions) ** 2)
+    total_sum = torch.sum((targets - torch.mean(targets)) ** 2)
+    if total_sum <= torch.finfo(targets.dtype).eps:
+        return float("nan")
+    return (1.0 - residual_sum / total_sum).item()
+
+
 def _classification_score(logits: torch.Tensor, targets: torch.Tensor) -> float:
     predictions = torch.argmax(logits, dim=1)
     return (predictions == targets).float().mean().item()
@@ -119,8 +130,8 @@ def run_epoch(
 
         outputs = model(x)
         if task == "regression":
-            outputs = outputs.float()
-            y = y.float()
+            outputs = outputs.float().reshape(-1, 1)
+            y = y.float().reshape(-1, 1)
         loss = criterion(outputs, y)
 
         if training:
@@ -137,13 +148,16 @@ def run_epoch(
     targets = torch.cat(gathered_targets, dim=0)
     if task == "regression":
         score = _regression_score(outputs, targets)
+        r2 = _regression_r2(outputs, targets)
     else:
         score = _classification_score(outputs, targets)
+        r2 = None
     return EvalResult(
         loss=total_loss / max(total_examples, 1),
         score=score,
         outputs=outputs,
         targets=targets,
+        r2=r2,
     )
 
 
@@ -193,6 +207,9 @@ def fit(
             "val_loss": val_result.loss,
             "val_score": val_result.score,
         }
+        if task == "regression":
+            row["train_r2"] = float(train_result.r2)
+            row["val_r2"] = float(val_result.r2)
         history.append(row)
         if metric_logger is not None:
             metric_logger(row)

@@ -218,8 +218,16 @@ def main() -> None:
             "best_epoch": int(best_row["epoch"]),
             "best_val_loss": float(best_row["val_loss"]),
             "best_val_score": float(best_row["val_score"]),
+            "best_val_r2": (
+                float(best_row["val_r2"])
+                if config.training.task == "regression"
+                else None
+            ),
             "test_loss": float(test_result.loss),
             "test_score": float(test_result.score),
+            "test_r2": (
+                None if test_result.r2 is None else float(test_result.r2)
+            ),
         }
         summary_path.write_text(json.dumps(summary, indent=2))
 
@@ -231,6 +239,7 @@ def main() -> None:
                     "best_val_score": summary["best_val_score"],
                     "test_loss": summary["test_loss"],
                     "test_score": summary["test_score"],
+                    "test_r2": summary["test_r2"],
                 },
                 step=int(summary["best_epoch"]),
             )

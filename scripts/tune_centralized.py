@@ -177,6 +177,8 @@ def main() -> None:
             "best_val_loss": float(best_history["val_loss"]),
             "best_val_score": float(best_history["val_score"]),
         }
+        if task == "regression":
+            row["best_val_r2"] = float(best_history["val_r2"])
         rows.append(row)
         print(json.dumps(row))
         if _candidate_is_better(task, row, best_row):
@@ -264,6 +266,9 @@ def main() -> None:
         "best_hyperparameters": best_row,
         "test_loss": float(test_result.loss),
         "test_score": float(test_result.score),
+        "test_r2": (
+            None if test_result.r2 is None else float(test_result.r2)
+        ),
         "model_path": str(model_path),
         "candidate_table_path": str(table_path),
         "test_confusion_matrix_path": (
