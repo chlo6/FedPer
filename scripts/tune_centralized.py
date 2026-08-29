@@ -12,6 +12,11 @@ from typing import Any
 import torch
 from torch import nn
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -24,8 +29,8 @@ from redo_by_sara.training import create_loaders, create_model, fit, run_epoch
 
 def _best_history_row(task: str, history: list[dict[str, float]]) -> dict[str, float]:
     if task == "regression":
-        return min(history, key=lambda row: row["val_score"])
-    return max(history, key=lambda row: row["val_score"])
+        return min(history, key=lambda row: (row["val_score"], row["val_loss"]))
+    return min(history, key=lambda row: (-row["val_score"], row["val_loss"]))
 
 
 def _candidate_is_better(
@@ -36,8 +41,74 @@ def _candidate_is_better(
     if current_best is None:
         return True
     if task == "regression":
-        return float(candidate["best_val_score"]) < float(current_best["best_val_score"])
-    return float(candidate["best_val_score"]) > float(current_best["best_val_score"])
+        candidate_key = (
+            float(candidate["best_val_score"]),
+            float(candidate["best_val_loss"]),
+        )
+        current_key = (
+            float(current_best["best_val_score"]),
+            float(current_best["best_val_loss"]),
+        )
+    else:
+        candidate_key = (
+            -float(candidate["best_val_score"]),
+            float(candidate["best_val_loss"]),
+        )
+        current_key = (
+            -float(current_best["best_val_score"]),
+            float(current_best["best_val_loss"]),
+        )
+    return candidate_key < current_key
+
+
+def _classification_confusion(
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+    num_classes: int,
+) -> list[list[int]]:
+    predictions = torch.argmax(outputs, dim=1)
+    matrix = [[0 for _ in range(num_classes)] for _ in range(num_classes)]
+    for true_id, predicted_id in zip(
+        targets.tolist(), predictions.tolist(), strict=True
+    ):
+        matrix[int(true_id)][int(predicted_id)] += 1
+    return matrix
+
+
+def _plot_classification_confusion(
+    matrix: list[list[int]],
+    class_names: list[str],
+    output_path: Path,
+) -> None:
+    figure, axis = plt.subplots(figsize=(7, 6))
+    image = axis.imshow(matrix, cmap="Blues")
+    figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+    axis.set_xticks(
+        range(len(class_names)), labels=class_names, rotation=45, ha="right"
+    )
+    axis.set_yticks(range(len(class_names)), labels=class_names)
+    axis.set_xlabel("Predicted class")
+    axis.set_ylabel("True class")
+    axis.set_title("Centralized CNN Test Confusion Matrix")
+
+    maximum = max((max(row) for row in matrix), default=0)
+    for row_index, row in enumerate(matrix):
+        row_total = sum(row)
+        for column_index, value in enumerate(row):
+            percentage = value / row_total if row_total else 0.0
+            color = "white" if maximum and value > maximum / 2 else "black"
+            axis.text(
+                column_index,
+                row_index,
+                f"{value}\n{percentage:.0%}",
+                ha="center",
+                va="center",
+                color=color,
+                fontsize=8,
+            )
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
 
 
 def main() -> None:
@@ -146,6 +217,37 @@ def main() -> None:
     model_path = config.output_dir / f"{result_stem}_best.pt"
     summary_path = config.output_dir / f"{result_stem}_summary.json"
 
+    confusion_path: Path | None = None
+    confusion_json_path: Path | None = None
+    if task == "classification":
+        subject_to_class = artifact["subject_to_class"]
+        class_names = [
+            str(subject)
+            for subject, _ in sorted(
+                subject_to_class.items(), key=lambda item: int(item[1])
+            )
+        ]
+        matrix = _classification_confusion(
+            test_result.outputs,
+            test_result.targets,
+            len(class_names),
+        )
+        confusion_path = config.output_dir / f"{result_stem}_test_confusion.png"
+        confusion_json_path = config.output_dir / f"{result_stem}_test_confusion.json"
+        _plot_classification_confusion(matrix, class_names, confusion_path)
+        confusion_json_path.write_text(
+            json.dumps(
+                {
+                    "split": "test",
+                    "class_names": class_names,
+                    "matrix": matrix,
+                    "accuracy": float(test_result.score),
+                    "num_examples": int(test_result.targets.numel()),
+                },
+                indent=2,
+            )
+        )
+
     with table_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
@@ -164,6 +266,12 @@ def main() -> None:
         "test_score": float(test_result.score),
         "model_path": str(model_path),
         "candidate_table_path": str(table_path),
+        "test_confusion_matrix_path": (
+            None if confusion_path is None else str(confusion_path)
+        ),
+        "test_confusion_json_path": (
+            None if confusion_json_path is None else str(confusion_json_path)
+        ),
     }
     summary_path.write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))

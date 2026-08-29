@@ -51,5 +51,5 @@ wandb:
   enabled: true
   project: centralized-floor-vibration
   entity: null
-  tags: ["centralized", "classification", "combined-dataset", "7-class"]
+  tags: ["centralized", "classification", "combined-dataset", "8-class"]
   watch: true
