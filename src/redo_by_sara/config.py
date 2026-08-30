@@ -53,6 +53,7 @@ class FederatedConfig:
     client_num_gpus: float = 0.0
     client_subjects: dict[str, list[str]] | None = None
     result_name: str | None = None
+    num_conv_blocks: int = 2
     shared_conv_blocks: int = 2
 
 
@@ -138,6 +139,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 if federated_cfg.get("result_name") in (None, "")
                 else str(federated_cfg.get("result_name"))
             ),
+            num_conv_blocks=int(federated_cfg.get("num_conv_blocks", 2)),
             shared_conv_blocks=int(federated_cfg.get("shared_conv_blocks", 2)),
         )
 
@@ -147,9 +149,14 @@ def load_config(path: str | Path) -> ExperimentConfig:
             raise ValueError("federated.num_rounds must be at least 1.")
         if federated.local_epochs < 1:
             raise ValueError("federated.local_epochs must be at least 1.")
-        if federated.shared_conv_blocks not in (1, 2):
+        if federated.num_conv_blocks not in (1, 2, 3):
             raise ValueError(
-                "federated.shared_conv_blocks must be 1 or 2 for SimpleCNN1D."
+                "federated.num_conv_blocks must be 1, 2, or 3 for SimpleCNN1D."
+            )
+        if not 1 <= federated.shared_conv_blocks <= federated.num_conv_blocks:
+            raise ValueError(
+                "federated.shared_conv_blocks must be between 1 and "
+                "federated.num_conv_blocks."
             )
     
     additional_dataset_roots = [

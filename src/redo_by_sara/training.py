@@ -57,6 +57,7 @@ MetricLogger = Callable[[dict[str, float]], None]
 def create_model(
     artifact: dict[str, object],
     task: str,
+    num_conv_blocks: int = 2,
     shared_conv_blocks: int = 2,
 ) -> nn.Module:
     in_channels = int(artifact["samples"].shape[1])
@@ -64,12 +65,14 @@ def create_model(
         return SimpleCNN1D(
             in_channels=in_channels,
             output_dim=1,
+            num_conv_blocks=num_conv_blocks,
             shared_conv_blocks=shared_conv_blocks,
         )
     num_classes = len(artifact["subject_to_class"])
     return SimpleCNN1D(
         in_channels=in_channels,
         output_dim=num_classes,
+        num_conv_blocks=num_conv_blocks,
         shared_conv_blocks=shared_conv_blocks,
     )
 

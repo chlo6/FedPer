@@ -76,14 +76,14 @@ def _build_wandb_config(
         "num_clients": federated.num_clients,
         "num_rounds": federated.num_rounds,
         "local_epochs": federated.local_epochs,
+        "num_conv_blocks": federated.num_conv_blocks,
         "shared_conv_blocks": federated.shared_conv_blocks,
         "client_subjects": client_subjects,
         "algorithm": "fedper",
         "shared_layers": f"first_{federated.shared_conv_blocks}_conv_blocks",
         "personal_layers": (
-            "classifier_head"
-            if federated.shared_conv_blocks == 2
-            else "second_conv_block_and_classifier_head"
+            f"remaining_{federated.num_conv_blocks - federated.shared_conv_blocks}_"
+            "conv_blocks_and_classifier"
         ),
     }
 
@@ -374,6 +374,7 @@ def main(force_iid: bool = False) -> None:
                 self.artifact,
                 self.task,
                 output_dim=self.output_dim if self.task == "classification" else None,
+                num_conv_blocks=self.experiment.federated.num_conv_blocks,
                 shared_conv_blocks=self.experiment.federated.shared_conv_blocks,
             )
             return get_base_parameters(model)
@@ -394,6 +395,7 @@ def main(force_iid: bool = False) -> None:
                 self.artifact,
                 self.task,
                 output_dim=self.output_dim if self.task == "classification" else None,
+                num_conv_blocks=self.experiment.federated.num_conv_blocks,
                 shared_conv_blocks=self.experiment.federated.shared_conv_blocks,
             ).to(self.device)
             if self.head_path.exists():
@@ -519,6 +521,7 @@ def main(force_iid: bool = False) -> None:
                     if config.training.task == "classification"
                     else None
                 ),
+                num_conv_blocks=config.federated.num_conv_blocks,
                 shared_conv_blocks=config.federated.shared_conv_blocks,
             ).to(server_device)
     
@@ -719,6 +722,7 @@ def main(force_iid: bool = False) -> None:
     initial_model = create_federated_model(
         artifact,
         config.training.task,
+        num_conv_blocks=config.federated.num_conv_blocks,
         shared_conv_blocks=config.federated.shared_conv_blocks,
     )
     initial_parameters = ndarrays_to_parameters(get_base_parameters(initial_model))
@@ -776,6 +780,7 @@ def main(force_iid: bool = False) -> None:
         final_model = create_federated_model(
             artifact,
             config.training.task,
+            num_conv_blocks=config.federated.num_conv_blocks,
             shared_conv_blocks=config.federated.shared_conv_blocks,
         ).to(server_device)
         set_base_parameters(final_model, final_parameters)
@@ -809,6 +814,7 @@ def main(force_iid: bool = False) -> None:
                     if config.training.task == "classification"
                     else None
                 ),
+                num_conv_blocks=config.federated.num_conv_blocks,
                 shared_conv_blocks=config.federated.shared_conv_blocks,
             ).to(server_device)
             set_base_parameters(client_model, final_parameters)
@@ -937,6 +943,7 @@ def main(force_iid: bool = False) -> None:
         torch.save(
             {
                 "algorithm": "fedper",
+                "num_conv_blocks": config.federated.num_conv_blocks,
                 "shared_conv_blocks": config.federated.shared_conv_blocks,
                 "base_state_dict": final_model.features.state_dict(),
                 "client_head_dir": str(client_head_dir),
@@ -953,8 +960,12 @@ def main(force_iid: bool = False) -> None:
         summary = {
             "task": config.training.task,
             "algorithm": "fedper",
+            "num_conv_blocks": config.federated.num_conv_blocks,
             "shared_conv_blocks": config.federated.shared_conv_blocks,
-            "local_conv_blocks": 2 - config.federated.shared_conv_blocks,
+            "local_conv_blocks": (
+                config.federated.num_conv_blocks
+                - config.federated.shared_conv_blocks
+            ),
             "partition_mode": "subject_owned_with_optional_shared_subjects",
             "result_name": config.federated.result_name,
             "model_path": str(model_path),

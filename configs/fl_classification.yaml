@@ -43,7 +43,8 @@ training:
   num_workers: 0
 
 federated:
-  # FedPer split: 1 shares Conv1; 2 shares Conv1 + Conv2 (the default).
+  # Architecture/split defaults. The study runner overrides both values.
+  num_conv_blocks: 2
   shared_conv_blocks: 2
   num_clients: 3
   num_rounds: 5
