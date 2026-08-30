@@ -518,6 +518,7 @@ def create_federated_model(
     artifact: dict[str, object],
     task: str,
     output_dim: int | None = None,
+    shared_conv_blocks: int = 2,
 ) -> nn.Module:
     if output_dim is not None:
         if task != "classification":
@@ -527,5 +528,10 @@ def create_federated_model(
         return SimpleCNN1D(
             in_channels=int(artifact["samples"].shape[1]),
             output_dim=output_dim,
+            shared_conv_blocks=shared_conv_blocks,
         )
-    return create_model(artifact=artifact, task=task)
+    return create_model(
+        artifact=artifact,
+        task=task,
+        shared_conv_blocks=shared_conv_blocks,
+    )
