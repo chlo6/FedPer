@@ -43,6 +43,9 @@ training:
   num_workers: 0
 
 federated:
+  # Selected FedPer architecture: Conv1 shared; Conv2, Conv3, and FC head local.
+  num_conv_blocks: 3
+  shared_conv_blocks: 1
   result_name: semi_non_iid
   num_clients: 2
   num_rounds: 5
